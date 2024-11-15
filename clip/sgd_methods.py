@@ -41,15 +41,50 @@ def vanilla_ode(K,T, noise_std, x0, xstar, lr):
         risks.append(R)
     return np.array(risks), np.array(ode_time)
 
+
+def clipped_ode_approx_opt(vals, vecs,T, x0, xstar, init_c, noise_std, lr, mu, nu, mu_nu_args):
+    dt = 0.1
+    d = np.sum(vals)
+
+    v = ((x0-xstar) @ vecs)**2 / 2
+    R = np.dot(vals,v)
+    
+    risks = []
+    lr_sched = []
+    clip_sched = []
+    ode_time = []
+    iters = int(T / dt)
+    for i in range(iters + 1):
+        t = i * dt
+        R = np.dot(vals,v)
+        
+        c = init_c * np.sqrt(2 * R + noise_std**2)
+        mu_nu_args['c'] = c
+        lr_comp = lr * np.maximum(1 / init_c, 1)
+        # print(lr_comp)
+        update = -lr_comp * 2 * v * vals* mu(R,**mu_nu_args) + lr_comp**2 * (vals * nu(R,**mu_nu_args)) / (2* d)
+        
+        v = v + dt * update
+
+        lr_sched.append(lr_comp)
+        clip_sched.append(c)
+        
+        ode_time.append(t)
+        risks.append(R)
+    return np.array(risks), np.array(ode_time), np.array(clip_sched), np.array(lr_sched)
+
+
 def clipped_ode(K,T, x0, xstar, lr, mu, nu, mu_nu_args):
     dt = 0.1
     d = np.trace(K)
 
+
     vals, vecs = np.linalg.eigh(K)
     v = ((x0-xstar) @ vecs)**2 / 2
     R = np.dot(vals,v)
+    
     risks = []
-
+    lr_sched = []
     ode_time = []
     iters = int(T / dt)
     for i in range(iters + 1):
@@ -66,21 +101,63 @@ def clipped_ode(K,T, x0, xstar, lr, mu, nu, mu_nu_args):
     return np.array(risks), np.array(ode_time), vals, vecs
 
 
+# def one_pass_clipped_sgd(K, A, y, x, target, lrk, ck):
+#     r = []
+#     times = []
+
+#     for i,(a,b) in enumerate(zip(A,y)):
+#         if i % 20 == 0:
+#             times.append(i)
+#             r.append(risk(K,x,target))
+
+#         grad = (np.dot(x,a) - b) * a
+
+#         if ck > 0:
+#             grad = clip(grad, ck)
+
+#         x = x - lrk * grad
+
+#     times.append(i+1)
+#     r.append(risk(K,x,target))
+#     return np.array(r), np.array(times)
+
+
 def one_pass_clipped_sgd(K, A, y, x, target, lrk, ck):
+    dt = 0.1    
     r = []
     times = []
-
+    d = K.shape[0]
+    sched = (np.size(lrk) > 1) or callable(lrk)
+    
+    if not sched:
+        lr = lrk
+        c = ck
+        
     for i,(a,b) in enumerate(zip(A,y)):
-        if i % 20 == 0:
+        if i % 20 == 0:            
             times.append(i)
             r.append(risk(K,x,target))
 
         grad = (np.dot(x,a) - b) * a
-
-        if ck > 0:
-            grad = clip(grad, ck)
-
-        x = x - lrk * grad
+        
+        # Get scheduled clip and lr values
+        if sched:
+            if callable(lrk):
+                R = risk(K,x, target)
+                lr = lrk(R)
+            else:
+                lr = lrk[int(np.round(i / d / dt))] 
+            
+            if callable(ck):
+                R = risk(K,x, target)
+                c = ck(R)
+            else:
+                c = ck[int(np.round(i / d / dt))] 
+            
+            
+        grad = clip(grad,c)
+                
+        x = x - lr * grad
 
     times.append(i+1)
     r.append(risk(K,x,target))

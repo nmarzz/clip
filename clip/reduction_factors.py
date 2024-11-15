@@ -66,52 +66,207 @@ def sum_pdf_t(x_values, risk, sigma, df):
 
     return results
 
-def mu_GMM(risk, weights, means, covariances, c):
-    # Compute P(not clipping) for Gaussian mixture noise
-    x_range = np.linspace(-c, c, 200)
-    pdf_vals = gmm_pdf(x_range, risk, weights, means, covariances)
 
-    return scipy.integrate.simpson(pdf_vals, x=x_range)
+import jax.numpy as jnp
+from jax import jit, vmap
+from jax.scipy.stats import norm
 
-def nu_GMM(risk, weights, means, covariances, c):
-    x_range = np.linspace(-c, c, 200)
-    pdf_vals = gmm_pdf(x_range, risk, weights, means, covariances)
 
-    integrand = x_range**2 * pdf_vals
-    truncated_var = scipy.integrate.simpson(integrand, x=x_range)
+resolution = 1500
 
-    # Compute P(clipping) = 1 - P(not clipping) = 1 - mu_GMM
-    p_clip = 1 - mu_GMM(risk, weights, means, covariances, c)
-
-    return (truncated_var + c**2 * p_clip)
-
+@jit
 def gmm_pdf(x_values, risk, weights, means, covariances):
     """
-    Computes the probability density function of a Gaussian Mixture Model (GMM) noise and gaussian data
+    Computes the probability density function of a Gaussian Mixture Model (GMM) noise and Gaussian data
     at given x_values using the provided weights, means, and covariances.
     """
+    # Constants for Gaussian noise term
+    v = jnp.sqrt(2 * risk)
+    v_sqrt_2pi = v * jnp.sqrt(2 * jnp.pi)
 
-    v = np.sqrt(2 * risk)
-    v_sqrt_2pi = v * np.sqrt(2 * np.pi)
-
-    # Precompute gau_pdf for the t_range
-    max_sigma = np.max(covariances)
-    t_range = np.linspace(-30 * max_sigma, 30 * max_sigma, 200)
-    gau_values = np.exp(-0.5 * (t_range / v)**2) / v_sqrt_2pi
+    # Define t_range based on maximum covariance, with precomputed Gaussian values
+    max_sigma = jnp.max(covariances)
+    t_range = jnp.linspace(-300 * max_sigma, 300 * max_sigma, resolution)
+    gau_values = jnp.exp(-0.5 * (t_range / v)**2) / v_sqrt_2pi
 
     # Prepare x_values as a 2D array for broadcasting
-    x_values = np.atleast_2d(x_values).T
+    x_values = jnp.atleast_2d(x_values).T  # Shape (len(x_values), 1) for broadcasting
 
-    # Compute GMM PDF for each x_values - t_range
-    gmm_values = np.zeros((x_values.shape[0], t_range.shape[0]))
-    for weight, mean, cov in zip(weights, means, covariances):
-        # GMM component PDFs
-        gmm_values += weight * scipy_normal.pdf(x_values - t_range, loc=mean[0], scale=np.sqrt(cov[0][0]))
-    
-    # Calculate the integrand for all x_values
+    # Compute GMM PDF for each component in vectorized form
+    def compute_component_pdf(mean, cov, weight):
+        std_dev = jnp.sqrt(cov[0][0])
+        return weight * norm.pdf(x_values - t_range, loc=mean[0], scale=std_dev)
+
+    # Vectorized computation of GMM values for each component
+    component_pdfs = vmap(compute_component_pdf, (0, 0, 0))(means, covariances, weights)
+    gmm_values = jnp.sum(component_pdfs, axis=0)  # Sum over the components
+
+    # Calculate the integrand as a product of gau_values and gmm_values
     integrand_values = gau_values * gmm_values
 
-    # Integrate over t_range using Simpson's rule for all x_values
-    results = scipy.integrate.simpson(integrand_values, x=t_range, axis=1)
+    # Simpson's rule integration weights
+    simpson_weights = jnp.ones(resolution)
+    simpson_weights = simpson_weights.at[1:-1:2].set(4)
+    simpson_weights = simpson_weights.at[2:-2:2].set(2)
+    simpson_weights *= (t_range[1] - t_range[0]) / 3.0
+
+    # Perform integration using precomputed weights
+    results = jnp.sum(integrand_values * simpson_weights, axis=1)
 
     return results
+
+@jit
+def mu_GMM(risk, weights, means, covariances, c):
+    """
+    Computes the probability of not clipping for Gaussian mixture noise
+    given the clipping threshold c.
+    """
+    x_range = jnp.linspace(-c, c, resolution // 2)
+    pdf_vals = gmm_pdf(x_range, risk, weights, means, covariances)
+
+    # Integrate using Simpson's rule over x_range
+    simpson_weights = jnp.ones(x_range.shape[0])
+    simpson_weights = simpson_weights.at[1:-1:2].set(4)
+    simpson_weights = simpson_weights.at[2:-2:2].set(2)
+    simpson_weights *= (x_range[1] - x_range[0]) / 3.0
+    result = jnp.sum(pdf_vals * simpson_weights)
+
+    return result
+
+@jit
+def nu_GMM(risk, weights, means, covariances, c):
+    """
+    Computes the variance scaling factor nu for Gaussian mixture noise under gradient clipping.
+    """
+    x_range = jnp.linspace(-c, c, resolution // 2)
+    pdf_vals = gmm_pdf(x_range, risk, weights, means, covariances)
+
+    # Compute integrand for truncated variance
+    integrand = x_range**2 * pdf_vals
+    simpson_weights = jnp.ones(x_range.shape[0])
+    simpson_weights = simpson_weights.at[1:-1:2].set(4)
+    simpson_weights = simpson_weights.at[2:-2:2].set(2)
+    simpson_weights *= (x_range[1] - x_range[0]) / 3.0
+    truncated_var = jnp.sum(integrand * simpson_weights)
+
+    # Compute probability of clipping
+    p_clip = 1 - mu_GMM(risk, weights, means, covariances, c)
+
+    # Return nu value
+    return truncated_var + c**2 * p_clip
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# resolution = 400
+# def mu_GMM(risk, weights, means, covariances, c):
+#     # Compute P(not clipping) for Gaussian mixture noise
+#     x_range = np.linspace(-c, c, resolution//2)
+#     pdf_vals = gmm_pdf(x_range, risk, weights, means, covariances)
+
+#     return scipy.integrate.simpson(pdf_vals, x=x_range)
+
+# def nu_GMM(risk, weights, means, covariances, c):
+#     x_range = np.linspace(-c, c, resolution//2)
+#     pdf_vals = gmm_pdf(x_range, risk, weights, means, covariances)
+
+#     integrand = x_range**2 * pdf_vals
+#     truncated_var = scipy.integrate.simpson(integrand, x=x_range)
+
+#     # Compute P(clipping) = 1 - P(not clipping) = 1 - mu_GMM
+#     p_clip = 1 - mu_GMM(risk, weights, means, covariances, c)
+
+#     return (truncated_var + c**2 * p_clip)
+
+
+# import jax.numpy as jnp
+# from jax import jit, vmap
+# from jax.scipy.stats import norm
+# import numpy as np  # for setup, but the core calculations use JAX
+
+# @jit
+# def gmm_pdf(x_values, risk, weights, means, covariances):
+#     """
+#     Computes the probability density function of a Gaussian Mixture Model (GMM) noise and Gaussian data
+#     at given x_values using the provided weights, means, and covariances.
+#     """
+#     # Constants for Gaussian noise term
+#     v = jnp.sqrt(2 * risk)
+#     v_sqrt_2pi = v * jnp.sqrt(2 * jnp.pi)
+
+#     # Define t_range based on maximum covariance, with precomputed Gaussian values
+#     max_sigma = jnp.max(covariances)
+#     t_range = jnp.linspace(-300 * max_sigma, 300 * max_sigma, resolution)
+#     gau_values = jnp.exp(-0.5 * (t_range / v)**2) / v_sqrt_2pi
+
+#     # Prepare x_values as a 2D array for broadcasting
+#     x_values = jnp.atleast_2d(x_values).T  # Shape (len(x_values), 1) for broadcasting
+
+#     # Compute GMM PDF for each component in vectorized form
+#     def compute_component_pdf(mean, cov, weight):
+#         std_dev = jnp.sqrt(cov[0][0])
+#         return weight * norm.pdf(x_values - t_range, loc=mean[0], scale=std_dev)
+
+#     # Vectorized computation of GMM values for each component
+#     component_pdfs = vmap(compute_component_pdf, (0, 0, 0))(means, covariances, weights)
+#     gmm_values = jnp.sum(component_pdfs, axis=0)  # Sum over the components
+
+#     # Calculate the integrand as a product of gau_values and gmm_values, then integrate
+#     integrand_values = gau_values * gmm_values
+
+#     # Simpson's rule integration
+#     simpson_weights = jnp.ones(resolution)
+#     simpson_weights = simpson_weights.at[1:-1:2].set(4)
+#     simpson_weights = simpson_weights.at[2:-2:2].set(2)
+#     simpson_weights *= (t_range[1] - t_range[0]) / 3.0
+
+#     # Perform integration using precomputed weights
+#     results = jnp.sum(integrand_values * simpson_weights, axis=1)
+
+#     return results
+
+# def gmm_pdf(x_values, risk, weights, means, covariances):
+#     """
+#     Computes the probability density function of a Gaussian Mixture Model (GMM) noise and gaussian data
+#     at given x_values using the provided weights, means, and covariances.
+#     """
+#     # Constants for Gaussian noise term
+#     v = np.sqrt(2 * risk)
+#     v_sqrt_2pi = v * np.sqrt(2 * np.pi)
+
+#     # Define t_range based on maximum covariance, with precomputed Gaussian values
+#     max_sigma = np.max(covariances)
+#     t_range = np.linspace(-300 * max_sigma, 300 * max_sigma, resolution)
+#     gau_values = np.exp(-0.5 * (t_range / v)**2) / v_sqrt_2pi
+
+#     # Prepare x_values as a 2D array for broadcasting
+#     x_values = np.atleast_2d(x_values).T  # Shape (len(x_values), 1) for broadcasting
+
+#     # Compute GMM PDF for each component in vectorized form
+#     gmm_values = np.zeros((x_values.shape[0], t_range.shape[0]))
+#     for weight, mean, cov in zip(weights, means, covariances):
+#         std_dev = np.sqrt(cov[0][0])  # Standard deviation for the Gaussian component
+#         gmm_values += weight * scipy_normal.pdf(x_values - t_range, loc=mean[0], scale=std_dev)
+    
+#     # Calculate the integrand as a product of gau_values and gmm_values, then integrate
+#     integrand_values = gau_values * gmm_values
+#     results = scipy.integrate.simpson(integrand_values, x=t_range, axis=1)
+
+#     return results
+
